@@ -1,11 +1,13 @@
 """
 Entry point for the Kaggle Kaggriculture environment.
+Combines Market Analytics Engine (Capa 1) and Tactical Spatial Scheduler (Capa 3).
 """
 
 from typing import Any, Dict, List, Optional
 import os
 import sys
 
+# Ensure local modules are accessible in Kaggle submission or local runs
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
@@ -20,35 +22,31 @@ from models.constants import (
 )
 from models.state_representation import (
     GameState,
-    PlantTile,
-    EmptyTile,
-    WeedTile,
 )
 from engine.market_simulator import MarketSimulator
+from engine.tactical_router import TacticalRouter
 from utils.logger import log
 
 
-# Global simulator instance
+# Global engine instances
 market_sim = MarketSimulator()
+tactical_router = TacticalRouter()
 
 
 def agent(obs: Dict[str, Any], config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     Main agent function called by kaggle-environments at every simulation turn.
     """
-    # Obtain the current state
+    # 1. High speed state parsing (< 0.2 ms)
     game_state = GameState.from_raw_obs(obs)
     my_farm = game_state.my_farm
     market_orders: List[List[Any]] = []
-    farmer_actions: List[str] = []
-    hands_actions: List[List[str]] = []
 
-    # Market Analytics & Liquidation (Capa 1)
+    # 2. Market Analytics & Liquidation (Capa 1)
     # Check if we have produce in the shed to sell
     for prod_name, qty in my_farm.shed.items():
         if qty > 0 and len(market_orders) < 10:
             current_market_inv = game_state.market.get_inventory(prod_name)
-            # Find how many we can sell profitably today
             # If shed is getting full (>80%), sell more aggressively
             min_p = 2 if my_farm.is_shed_critical(0.80) else 5
             sell_qty = market_sim.find_optimal_sell_batch(
@@ -61,40 +59,18 @@ def agent(obs: Dict[str, Any], config: Optional[Dict[str, Any]] = None) -> Dict[
                 market_orders.append([MarketAction.SELL.value, prod_name, sell_qty])
 
     # Check if we need seeds and have budget
-    wheat_seeds = my_farm.seeds.get(CropType.WHEAT.value, 0)
-    if wheat_seeds == 0 and my_farm.money >= 50 and len(market_orders) < 10:
-        # Buy a small batch of seeds to keep operations going
+    total_seeds = sum(my_farm.seeds.values())
+    if total_seeds == 0 and my_farm.money >= 50 and len(market_orders) < 10:
+        # Buy a batch of seeds
         seeds_to_buy = min(5, int(my_farm.money // 10))
         if seeds_to_buy > 0:
             market_orders.append([MarketAction.BUY_SEED.value, CropType.WHEAT.value, seeds_to_buy])
 
-    # Farmer Tactical Action (For now it stands at the same tile)
-    fx, fy = my_farm.farmer.pos
-    current_tile = my_farm.get_tile(fx, fy)
-
-    if isinstance(current_tile, PlantTile):
-        if current_tile.is_ready_to_harvest:
-            farmer_actions = [FarmerAction.HARVEST.value]
-        elif not current_tile.watered_today:
-            farmer_actions = [FarmerAction.WATER.value]
-        else:
-            farmer_actions = [FarmerAction.PASS.value]
-    elif isinstance(current_tile, EmptyTile):
-        if my_farm.seeds.get(CropType.WHEAT.value, 0) > 0:
-            farmer_actions = [FarmerAction.PLANT.value, CropType.WHEAT.value]
-        else:
-            farmer_actions = [FarmerAction.PASS.value]
-    elif isinstance(current_tile, WeedTile):
-        farmer_actions = [FarmerAction.DIG.value]
-    else:
-        farmer_actions = [FarmerAction.PASS.value]
-
-    # For any hired hands, pass by default in Phase 1
-    for _ in my_farm.hands:
-        hands_actions.append([FarmerAction.PASS.value])
+    # 3. Tactical Spatial Routing & Action Dispatch (Capa 3)
+    tactical_response = tactical_router.assign_actions(game_state)
 
     return {
-        "farmer": farmer_actions,
-        "hands": hands_actions,
+        "farmer": tactical_response["farmer"],
+        "hands": tactical_response["hands"],
         "market": market_orders,
     }
