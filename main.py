@@ -7,10 +7,18 @@ from typing import Any, Dict, List, Optional
 import os
 import sys
 
-# Ensure local modules are accessible in Kaggle submission or local runs
-current_dir = os.path.dirname(os.path.abspath(__file__))
-if current_dir not in sys.path:
-    sys.path.insert(0, current_dir)
+# Ensure local modules and packages are accessible across all execution modes
+candidates = [
+    os.getcwd(),
+    os.path.dirname(__file__) if "__file__" in globals() else None,
+    "/kaggle_simulations/agent",
+    os.path.abspath("."),
+]
+for candidate in candidates:
+    if candidate and os.path.exists(os.path.join(candidate, "models")):
+        if candidate not in sys.path:
+            sys.path.insert(0, candidate)
+        break
 
 from models.constants import (
     CropType,
@@ -34,44 +42,52 @@ market_sim = MarketSimulator()
 macro_planner = MacroPlanner()
 tactical_router = TacticalRouter()
 
-# State cache across turns in an episode
-_current_macro_plan: Optional[MacroPlan] = None
-_last_plan_day: int = -1
+# State cache per player (handles both single agent and self-play in same process)
+_current_macro_plans: Dict[int, MacroPlan] = {}
+_last_plan_days: Dict[int, int] = {}
 
 
 def agent(obs: Dict[str, Any], config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     Main agent function called by kaggle-environments at every simulation turn.
     """
-    global _current_macro_plan, _last_plan_day
+    global _current_macro_plans, _last_plan_days
 
     # 1. High speed state parsing (< 0.2 ms)
     game_state = GameState.from_raw_obs(obs)
     my_farm = game_state.my_farm
+    my_id = game_state.my_player_id
     current_day = game_state.day
     market_orders: List[List[Any]] = []
 
+    # Reset player state on new match
+    if game_state.global_turn == 0:
+        _last_plan_days[my_id] = -1
+
     # 2. Daily Macro-Planning (Capa 2)
     # Generate new plan at turn 0 of each day or reset upon new game
-    if current_day != _last_plan_day or _current_macro_plan is None:
-        _current_macro_plan = macro_planner.generate_daily_macro_plan(game_state, market_sim)
-        _last_plan_day = current_day
+    if _last_plan_days.get(my_id, -1) != current_day or my_id not in _current_macro_plans:
+        _current_macro_plans[my_id] = macro_planner.generate_daily_macro_plan(game_state, market_sim)
+        _last_plan_days[my_id] = current_day
 
         # Issue Daily Macro Orders on the first turn of the day
         if game_state.is_first_turn_of_day:
+            plan = _current_macro_plans[my_id]
             # A. Land Expansion Order
-            if _current_macro_plan.buy_land_quadrant is not None and len(market_orders) < MAX_MARKET_ORDERS_PER_TURN:
+            if plan.buy_land_quadrant is not None and len(market_orders) < MAX_MARKET_ORDERS_PER_TURN:
                 market_orders.append([MarketAction.BUY_LAND.value])
 
             # B. Farm Hand Hiring Orders (Fibonacci labor)
-            for _ in range(_current_macro_plan.hands_to_hire):
+            for _ in range(plan.hands_to_hire):
                 if len(market_orders) < MAX_MARKET_ORDERS_PER_TURN:
                     market_orders.append([MarketAction.HIRE.value])
 
             # C. Seed Purchase Orders
-            for crop_name, qty in _current_macro_plan.seed_orders.items():
+            for crop_name, qty in plan.seed_orders.items():
                 if qty > 0 and len(market_orders) < MAX_MARKET_ORDERS_PER_TURN:
                     market_orders.append([MarketAction.BUY_SEED.value, crop_name, qty])
+
+    plan = _current_macro_plans[my_id]
 
     # 3. Market Analytics & Liquidation (Capa 1)
     days_left = 30 - current_day
@@ -107,12 +123,12 @@ def agent(obs: Dict[str, Any], config: Optional[Dict[str, Any]] = None) -> Dict[
     # Mid-day emergency seed replenishment if farm is completely out of seeds
     total_seeds = sum(my_farm.seeds.values())
     if total_seeds == 0 and my_farm.money >= 100 and days_left > 3 and len(market_orders) < MAX_MARKET_ORDERS_PER_TURN:
-        pref = _current_macro_plan.preferred_seed_order if _current_macro_plan else [CropType.CARROT.value, CropType.WHEAT.value]
+        pref = plan.preferred_seed_order if plan else [CropType.CARROT.value, CropType.WHEAT.value]
         top_crop = pref[0] if pref else CropType.WHEAT.value
         market_orders.append([MarketAction.BUY_SEED.value, top_crop, 5])
 
     # 4. Tactical Spatial Routing & Action Dispatch (Capa 3)
-    preferred_order = _current_macro_plan.preferred_seed_order if _current_macro_plan else None
+    preferred_order = plan.preferred_seed_order if plan else None
     tactical_response = tactical_router.assign_actions(game_state, preferred_seed_order=preferred_order)
 
     return {
