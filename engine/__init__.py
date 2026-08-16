@@ -12,6 +12,10 @@ from .tactical_router import (
     TacticalRouter,
     Task,
 )
+from .macro_planner import (
+    MacroPlanner,
+    MacroPlan,
+)
 
 __all__ = [
     "MarketSimulator",
@@ -20,4 +24,6 @@ __all__ = [
     "PriceProjection",
     "TacticalRouter",
     "Task",
+    "MacroPlanner",
+    "MacroPlan",
 ]
