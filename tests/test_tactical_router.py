@@ -7,6 +7,9 @@ import pytest
 from models.constants import (
     BOARD_SIZE,
     CropType,
+    AnimalType,
+    ProductType,
+    StructureType,
     Direction,
     FarmerAction,
     SHED_ACCESS_TILES,
@@ -24,6 +27,7 @@ from models.state_representation import (
     WeedTile,
 )
 from engine.tactical_router import TacticalRouter, Task
+
 
 
 @pytest.fixture
@@ -244,3 +248,114 @@ class TestMultiAgentActionAssignment:
         assert actions["farmer"] == ["DROP"]
         # Hand 1 is far from shed -> moves towards (4,4)
         assert actions["hands"][0] in (["EAST"], ["SOUTH"])
+
+
+class TestLivestockAndFertilizerTaskGeneration:
+    """Validates prioritized task generation for livestock production, structures, and fertilization."""
+
+    def test_p1_animal_harvest_task(self, router: TacticalRouter, empty_game_state: GameState):
+        farm = empty_game_state.my_farm
+        farm.tiles[0][0] = StructureTile(kind="COOP", animal="GOOSE", yield_units=2, fed_today=True)
+        tasks = router.generate_daily_tasks(empty_game_state)
+
+        harvest_tasks = [t for t in tasks if t.task_type == FarmerAction.HARVEST and t.target_pos == (0, 0)]
+        assert len(harvest_tasks) == 1
+        assert harvest_tasks[0].priority == 1
+
+    def test_p1_collect_fertilizer_task(self, router: TacticalRouter, empty_game_state: GameState):
+        farm = empty_game_state.my_farm
+        farm.tiles[0][0] = StructureTile(kind="COOP", animal="GOOSE", fertilizer_available=True)
+        tasks = router.generate_daily_tasks(empty_game_state)
+
+        fert_tasks = [t for t in tasks if t.task_type == FarmerAction.COLLECT_FERTILIZER and t.target_pos == (0, 0)]
+        assert len(fert_tasks) == 1
+        assert fert_tasks[0].priority == 1
+
+    def test_p2_preventive_feed_and_care_tasks(self, router: TacticalRouter, empty_game_state: GameState):
+        farm = empty_game_state.my_farm
+        # Unfed animal -> generates FEED task
+        farm.tiles[1][1] = StructureTile(kind="PASTURE", animal="COW", fed_today=False, cared_today=False)
+        tasks_unfed = router.generate_daily_tasks(empty_game_state)
+        feed_tasks = [t for t in tasks_unfed if t.task_type == FarmerAction.FEED and t.target_pos == (1, 1)]
+        assert len(feed_tasks) == 1 and feed_tasks[0].priority == 2
+
+        # Once fed -> generates CARE task
+        farm.tiles[1][1].fed_today = True
+        tasks_fed = router.generate_daily_tasks(empty_game_state)
+        care_tasks = [t for t in tasks_fed if t.task_type == FarmerAction.CARE and t.target_pos == (1, 1)]
+        assert len(care_tasks) == 1 and care_tasks[0].priority == 2
+
+
+    def test_p2_fertilize_application_task(self, router: TacticalRouter, empty_game_state: GameState):
+        farm = empty_game_state.my_farm
+        farm.tiles[2][2] = PlantTile(crop="MELON", planted_day=1, fertilized_until_day=-1, watered_today=True)
+        tasks = router.generate_daily_tasks(empty_game_state, fertilizer_targets=[(2, 2)])
+
+        fert_tasks = [t for t in tasks if t.task_type == FarmerAction.FERTILIZE and t.target_pos == (2, 2)]
+        assert len(fert_tasks) == 1
+        assert fert_tasks[0].priority == 2
+
+    def test_p3_build_structure_tasks(self, router: TacticalRouter, empty_game_state: GameState):
+        farm = empty_game_state.my_farm
+        farm.tiles[3][3] = EmptyTile()
+        tasks = router.generate_daily_tasks(empty_game_state, structure_build_orders=[("COOP", (3, 3))])
+
+        build_tasks = [t for t in tasks if t.task_type == FarmerAction.BUILD_COOP and t.target_pos == (3, 3)]
+        assert len(build_tasks) == 1
+        assert build_tasks[0].priority == 3
+
+
+class TestLivestockAndFertilizerLogistics:
+    """Validates multi-agent coordination, pickup/place logistics, and conflict avoidance."""
+
+    def test_animal_pickup_from_shed(self, router: TacticalRouter, empty_game_state: GameState):
+        farm = empty_game_state.my_farm
+        farm.farmer = UnitState(id=0, x=4, y=4)  # Adjacent to shed
+        farm.shed = {"GOOSE": 1}
+        # Empty coop at (0, 0)
+        farm.tiles[0][0] = StructureTile(kind="COOP", animal=None)
+
+        actions = router.assign_actions(empty_game_state)
+        # Farmer at shed interacts with shed -> PICKUP GOOSE 1
+        assert actions["farmer"] == ["PICKUP", "GOOSE", 1]
+
+    def test_animal_placement_in_structure(self, router: TacticalRouter, empty_game_state: GameState):
+        farm = empty_game_state.my_farm
+        # Farmer carrying a Goose is at (1, 1), empty coop is at (1, 1)
+        farm.farmer = UnitState(id=0, x=1, y=1, inventory={"GOOSE": 1})
+        farm.tiles[1][1] = StructureTile(kind="COOP", animal=None)
+
+        actions = router.assign_actions(empty_game_state)
+        assert actions["farmer"] == ["PLACE", "GOOSE", 1]
+
+    def test_fertilizer_pickup_from_shed(self, router: TacticalRouter, empty_game_state: GameState):
+        farm = empty_game_state.my_farm
+        farm.farmer = UnitState(id=0, x=4, y=4)
+        farm.shed = {"FERTILIZER": 2}
+        farm.tiles[0][0] = PlantTile(crop="MELON", planted_day=1, fertilized_until_day=-1)
+
+        actions = router.assign_actions(empty_game_state, fertilizer_target_tiles=[(0, 0)])
+        assert actions["farmer"] == ["PICKUP", "FERTILIZER", 1]
+
+    def test_feed_care_deduplication_multi_agent(self, router: TacticalRouter, empty_game_state: GameState):
+        farm = empty_game_state.my_farm
+        # 2 workers near 1 cow
+        farm.farmer = UnitState(id=0, x=0, y=0)
+        farm.hands = [UnitState(id=1, x=0, y=1)]
+        farm.tiles[0][0] = StructureTile(kind="PASTURE", animal="COW", fed_today=False, cared_today=False)
+
+        actions = router.assign_actions(empty_game_state)
+        # One worker feeds, the other either cares or does something else, but they don't duplicate FEED
+        feed_count = sum(1 for act in [actions["farmer"], actions["hands"][0]] if act == ["FEED"])
+        assert feed_count <= 1
+
+    def test_fertilize_does_not_repeat_on_fertilized_crop(self, router: TacticalRouter, empty_game_state: GameState):
+        farm = empty_game_state.my_farm
+        farm.farmer = UnitState(id=0, x=1, y=1, inventory={"FERTILIZER": 1})
+        # Plant at (1,1) is already fertilized until day 5
+        farm.tiles[1][1] = PlantTile(crop="MELON", planted_day=1, fertilized_until_day=5)
+
+        actions = router.assign_actions(empty_game_state, fertilizer_target_tiles=[(1, 1)])
+        # Cannot fertilize the already fertilized plant
+        assert actions["farmer"] != ["FERTILIZE"]
+

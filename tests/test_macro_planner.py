@@ -8,8 +8,11 @@ import pytest
 from models.constants import (
     BOARD_SIZE,
     CROP_SPECS,
+    ANIMAL_SPECS,
     CropType,
+    AnimalType,
     ProductType,
+    StructureType,
 )
 from models.state_representation import (
     EmptyTile,
@@ -17,12 +20,14 @@ from models.state_representation import (
     GameState,
     MarketState,
     PlantTile,
+    StructureTile,
     TownState,
     UnitState,
     WeedTile,
 )
 from engine.market_simulator import MarketSimulator
 from engine.macro_planner import MacroPlanner, MacroPlan
+
 
 
 @pytest.fixture
@@ -219,3 +224,103 @@ class TestPriceElasticityPortfolioShift:
         assert rois_glut["CARROT"] > rois_glut["MELON"]
         plan_glut = planner.generate_daily_macro_plan(state_glut, sim)
         assert plan_glut.preferred_seed_order[0] != "MELON"
+
+
+class TestLivestockROIsAndCutoffs:
+    """Validates dynamic livestock ROI computation and strict terminal horizon cutoffs."""
+
+    def test_animal_roi_day_0_positive(self, planner: MacroPlanner, sim: MarketSimulator):
+        state = create_mock_game_state(day=0)
+        rois = planner.compute_animal_rois(state, sim)
+
+        assert rois["GOOSE"] > 0
+        assert rois["COW"] > 0
+        assert rois["SHEEP"] > 0
+
+    def test_goose_cutoff_day_15(self, planner: MacroPlanner, sim: MarketSimulator):
+        # Goose cutoff is day 14 -> at day 15 ROI must be -inf
+        state = create_mock_game_state(day=15)
+        rois = planner.compute_animal_rois(state, sim)
+        assert math.isinf(rois["GOOSE"]) and rois["GOOSE"] < 0
+
+    def test_cow_sheep_cutoff_day_11(self, planner: MacroPlanner, sim: MarketSimulator):
+        # Cow and Sheep cutoff is day 10 -> at day 11 ROI must be -inf
+        state = create_mock_game_state(day=11)
+        rois = planner.compute_animal_rois(state, sim)
+        assert math.isinf(rois["COW"]) and rois["COW"] < 0
+        assert math.isinf(rois["SHEEP"]) and rois["SHEEP"] < 0
+
+    def test_livestock_care_bonus_roi_projection(self, planner: MacroPlanner, sim: MarketSimulator):
+        # Ensure ROI calculation accounts for (1 + interval) yields from daily CARE
+        state = create_mock_game_state(day=0)
+        rois = planner.compute_animal_rois(state, sim)
+        # Goose yields 2 eggs per day with care, so expected revenue per day is ~2 * $50 = $100
+        assert rois["GOOSE"] > 20.0
+
+
+class TestWheatReservePolicy:
+    """Validates 4-day wheat safety buffer, deficit calculation, and 16-unit shed cap."""
+
+    def test_wheat_reserve_blocks_animal_purchase(self, planner: MacroPlanner, sim: MarketSimulator):
+        # Money is only $310 -> Goose costs $300 + 4 wheat (~$100) -> not enough budget
+        state = create_mock_game_state(day=0, money=310.0)
+        animal_rois = planner.compute_animal_rois(state, sim)
+        crop_rois = planner.compute_crop_rois(state, sim)
+
+        orders, builds, spent = planner.evaluate_livestock_plan(state, animal_rois, crop_rois, 310.0, sim)
+        assert len(orders) == 0
+
+    def test_wheat_reserve_auto_buy_orders(self, planner: MacroPlanner, sim: MarketSimulator):
+        # Farm has 1 living goose on farm, shed has 0 wheat -> deficit must be 4 wheat
+        state = create_mock_game_state(day=1, money=2000.0)
+        state.my_farm.tiles[0][0] = StructureTile(kind="COOP", animal="GOOSE")
+
+        deficit, cost = planner.evaluate_wheat_reserve(state, sim, prospective_animals=0)
+        assert deficit == 4
+        assert cost > 0
+
+    def test_wheat_reserve_cap_16_units(self, planner: MacroPlanner, sim: MarketSimulator):
+        # Farm has 5 animals (would theoretically need 20 wheat), but cap is 16
+        state = create_mock_game_state(day=1, money=3000.0)
+        for i in range(5):
+            state.my_farm.tiles[0][i] = StructureTile(kind="COOP", animal="GOOSE")
+
+        deficit, cost = planner.evaluate_wheat_reserve(state, sim, prospective_animals=0)
+        assert deficit == 16
+
+
+class TestFertilizerShadowValueMatrix:
+    """Validates shadow value prioritization: STRAWBERRY >= MELON > TOMATO > Spot."""
+
+    def test_fertilizer_shadow_matrix_strawberry_melon_priority(self, planner: MacroPlanner, sim: MarketSimulator):
+        state = create_mock_game_state(day=5)
+        # Put 1 Strawberry at (0,0), 1 Melon at (1,1), 1 Tomato at (2,2), 1 Carrot at (3,3)
+        state.my_farm.tiles[0][0] = PlantTile(crop="STRAWBERRY", planted_day=5, fertilized_until_day=-1)
+        state.my_farm.tiles[1][1] = PlantTile(crop="MELON", planted_day=5, fertilized_until_day=-1)
+        state.my_farm.tiles[2][2] = PlantTile(crop="TOMATO", planted_day=5, fertilized_until_day=-1)
+        state.my_farm.tiles[3][3] = PlantTile(crop="CARROT", planted_day=5, fertilized_until_day=-1)
+
+        targets = planner.evaluate_fertilizer_shadow_matrix(state, sim)
+        # High value crops (Strawberry, Melon, Tomato) should be prioritized before Carrot
+        assert (0, 0) in targets or (1, 1) in targets
+        assert targets[0] in [(0, 0), (1, 1)]
+
+    def test_fertilizer_shadow_matrix_skips_already_fertilized(self, planner: MacroPlanner, sim: MarketSimulator):
+        state = create_mock_game_state(day=5)
+        # Strawberry already fertilized until day 7
+        state.my_farm.tiles[0][0] = PlantTile(crop="STRAWBERRY", planted_day=5, fertilized_until_day=7)
+        targets = planner.evaluate_fertilizer_shadow_matrix(state, sim)
+        assert (0, 0) not in targets
+
+
+class TestIntegratedLivestockMacroPlan:
+    """Validates that daily macro plan schedules livestock and structure orders cohesively."""
+
+    def test_macro_plan_generates_animal_and_structure_orders(self, planner: MacroPlanner, sim: MarketSimulator):
+        # Day 0 with $3000 cash -> should schedule animal purchase and build structure
+        state = create_mock_game_state(day=0, money=3000.0)
+        plan = planner.generate_daily_macro_plan(state, sim)
+
+        assert "GOOSE" in plan.animal_orders or "COW" in plan.animal_orders or "SHEEP" in plan.animal_orders
+        assert len(plan.structure_build_orders) > 0 or len(state.my_farm.get_empty_structures()) > 0
+
