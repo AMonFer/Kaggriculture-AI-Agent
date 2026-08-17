@@ -270,6 +270,26 @@ ANIMAL_SPECS: Dict[str, AnimalSpec] = {
     ),
 }
 
+# Livestock & Fertilizer Management Constants
+ANIMAL_CUTOFF_DAYS: Dict[str, int] = {
+    AnimalType.GOOSE.value: 14,
+    AnimalType.COW.value: 10,
+    AnimalType.SHEEP.value: 10,
+}
+WHEAT_RESERVE_DAYS: int = 4
+MAX_WHEAT_RESERVE_IN_SHED: int = 16
+FERTILIZER_EFFECT_DURATION_DAYS: int = 3
+STRUCTURE_FOR_ANIMAL: Dict[str, str] = {
+    AnimalType.GOOSE.value: StructureType.COOP.value,
+    AnimalType.COW.value: StructureType.PASTURE.value,
+    AnimalType.SHEEP.value: StructureType.PASTURE.value,
+}
+BUILD_ACTION_FOR_STRUCTURE: Dict[str, str] = {
+    StructureType.COOP.value: FarmerAction.BUILD_COOP.value,
+    StructureType.PASTURE.value: FarmerAction.BUILD_PASTURE.value,
+}
+
+
 
 # ==========================================
 # Market Parameters (Official Engine Spec)
