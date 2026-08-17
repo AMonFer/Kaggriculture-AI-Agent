@@ -129,12 +129,13 @@ def agent(obs: Dict[str, Any], config: Optional[Dict[str, Any]] = None) -> Dict[
                 if sell_qty > 0:
                     market_orders.append([MarketAction.SELL.value, prod_name, sell_qty])
 
-    # Mid-day emergency seed replenishment if farm is completely out of seeds
+    # Mid-day emergency seed replenishment if farm is completely out of seeds (only after turn 0)
     total_seeds = sum(my_farm.seeds.values())
-    if total_seeds == 0 and my_farm.money >= 100 and days_left > 3 and len(market_orders) < MAX_MARKET_ORDERS_PER_TURN:
+    if not game_state.is_first_turn_of_day and total_seeds == 0 and my_farm.money >= 100 and days_left > 3 and len(market_orders) < MAX_MARKET_ORDERS_PER_TURN:
         pref = plan.preferred_seed_order if plan else [CropType.CARROT.value, CropType.WHEAT.value]
         top_crop = pref[0] if pref else CropType.WHEAT.value
         market_orders.append([MarketAction.BUY_SEED.value, top_crop, 5])
+
 
     # 4. Tactical Spatial Routing & Action Dispatch (Capa 3)
     preferred_order = plan.preferred_seed_order if plan else None

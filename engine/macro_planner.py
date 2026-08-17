@@ -538,9 +538,12 @@ class MacroPlanner:
         game_state: GameState,
         rois: Dict[str, float],
         available_money: float,
+        planned_structures_count: int = 0,
     ) -> Tuple[Dict[str, int], List[str]]:
         """
-        Allocates seed purchase orders to the highest-ROI crops within space and budget limits.
+        Allocates seed purchase orders to the highest-ROI crops, strictly bounded by:
+        Max_Seeds = max(0, Empty_Unlocked_Tiles - Seeds_In_Stock - Planned_Structures)
+        Prevents capital lock from buying excess seeds.
         """
         my_farm = game_state.my_farm
         current_day = game_state.day
@@ -567,14 +570,11 @@ class MacroPlanner:
                     empty_unlocked_tiles += 1
 
         existing_seeds = sum(my_farm.seeds.values())
-        seeds_needed = max(0, empty_unlocked_tiles - existing_seeds)
+        # Strictly bound to real plantable capacity
+        total_to_buy = max(0, empty_unlocked_tiles - existing_seeds - planned_structures_count)
 
-        # Cap batch purchase to what can be managed and stored
-        max_seeds_to_buy = min(empty_unlocked_tiles + 4, 30)
-        if seeds_needed <= 0 and existing_seeds >= 10:
+        if total_to_buy <= 0:
             return {}, preferred_order
-
-        total_to_buy = min(seeds_needed if seeds_needed > 0 else 5, max_seeds_to_buy)
 
         seed_orders: Dict[str, int] = {}
         remaining_budget = available_money
@@ -621,7 +621,7 @@ class MacroPlanner:
         - Crop & Animal dynamic ROIs
         - Land Expansion
         - Livestock purchases, structure construction, and wheat food safety buffer
-        - Seed budget allocation & preferred planting order
+        - Seed budget allocation & preferred planting order (strictly bounded)
         - Fertilizer target allocation matrix
         - Fibonacci labor scaling
         - Terminal harvest liquidation
@@ -651,11 +651,14 @@ class MacroPlanner:
         )
         cash_after_livestock = max(0.0, cash_after_land - spent_livestock)
 
-        # 4. Seed budget allocation
+        # 4. Seed budget allocation (bounded by empty tiles minus planned structures)
         seed_budget = cash_after_livestock * 0.85
-        seed_orders, preferred_seed_order = self.allocate_seed_budget(game_state, crop_rois, seed_budget)
+        seed_orders, preferred_seed_order = self.allocate_seed_budget(
+            game_state, crop_rois, seed_budget, planned_structures_count=len(build_orders)
+        )
         seed_spend = sum(seed_orders.get(c, 0) * CROP_SPECS[c].seed_cost for c in seed_orders)
         cash_after_seeds = max(0.0, cash_after_livestock - seed_spend)
+
 
         # 5. Evaluate labor hiring (Fibonacci scaling)
         target_plantings = sum(seed_orders.values()) + sum(my_farm.seeds.values())
