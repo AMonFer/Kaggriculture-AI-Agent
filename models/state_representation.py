@@ -178,6 +178,42 @@ class FarmState:
                         count += 1
         return count
 
+    def get_empty_structures(self, structure_type: Optional[str] = None) -> List[Tuple[int, int, StructureTile]]:
+        """Returns coordinates and tile for unoccupied structures (kind COOP or PASTURE)."""
+        empty_structs: List[Tuple[int, int, StructureTile]] = []
+        for y, row in enumerate(self.tiles):
+            for x, tile in enumerate(row):
+                if isinstance(tile, StructureTile) and not tile.is_occupied:
+                    if structure_type is None or tile.kind == structure_type:
+                        empty_structs.append((x, y, tile))
+        return empty_structs
+
+    def get_occupied_structures(self, animal: Optional[str] = None) -> List[Tuple[int, int, StructureTile]]:
+        """Returns coordinates and tile for structures with living animals."""
+        occupied: List[Tuple[int, int, StructureTile]] = []
+        for y, row in enumerate(self.tiles):
+            for x, tile in enumerate(row):
+                if isinstance(tile, StructureTile) and tile.is_occupied:
+                    if animal is None or tile.animal == animal:
+                        occupied.append((x, y, tile))
+        return occupied
+
+    def get_fertilizable_plants(self, current_day: int = 0) -> List[Tuple[int, int, PlantTile]]:
+        """Returns active plant tiles that can receive fertilizer."""
+        plants: List[Tuple[int, int, PlantTile]] = []
+        for y, row in enumerate(self.tiles):
+            for x, tile in enumerate(row):
+                if isinstance(tile, PlantTile):
+                    if tile.fertilized_until_day < current_day:
+                        plants.append((x, y, tile))
+        return plants
+
+    def get_animals_in_shed(self) -> Dict[str, int]:
+        """Returns purchased animals held in shed awaiting placement."""
+        animal_keys = {AnimalType.GOOSE.value, AnimalType.COW.value, AnimalType.SHEEP.value}
+        return {k: v for k, v in self.shed.items() if k in animal_keys and v > 0}
+
+
 
 # ==========================================
 # Market and Town State
