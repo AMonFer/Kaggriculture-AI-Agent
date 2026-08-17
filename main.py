@@ -77,12 +77,21 @@ def agent(obs: Dict[str, Any], config: Optional[Dict[str, Any]] = None) -> Dict[
             if plan.buy_land_quadrant is not None and len(market_orders) < MAX_MARKET_ORDERS_PER_TURN:
                 market_orders.append([MarketAction.BUY_LAND.value])
 
-            # B. Farm Hand Hiring Orders (Fibonacci labor)
+            # B. Wheat Reserve Buffer Order (Food safety)
+            if plan.wheat_buy_orders > 0 and len(market_orders) < MAX_MARKET_ORDERS_PER_TURN:
+                market_orders.append([MarketAction.BUY_PRODUCT.value, ProductType.WHEAT.value, plan.wheat_buy_orders])
+
+            # C. Animal Purchase Orders
+            for animal_name, qty in plan.animal_orders.items():
+                if qty > 0 and len(market_orders) < MAX_MARKET_ORDERS_PER_TURN:
+                    market_orders.append([MarketAction.BUY_ANIMAL.value, animal_name, qty])
+
+            # D. Farm Hand Hiring Orders (Fibonacci labor)
             for _ in range(plan.hands_to_hire):
                 if len(market_orders) < MAX_MARKET_ORDERS_PER_TURN:
                     market_orders.append([MarketAction.HIRE.value])
 
-            # C. Seed Purchase Orders
+            # E. Seed Purchase Orders
             for crop_name, qty in plan.seed_orders.items():
                 if qty > 0 and len(market_orders) < MAX_MARKET_ORDERS_PER_TURN:
                     market_orders.append([MarketAction.BUY_SEED.value, crop_name, qty])
@@ -92,7 +101,7 @@ def agent(obs: Dict[str, Any], config: Optional[Dict[str, Any]] = None) -> Dict[
     # 3. Market Analytics & Liquidation (Capa 1)
     days_left = 30 - current_day
     for prod_name, qty in my_farm.shed.items():
-        if qty > 0 and len(market_orders) < MAX_MARKET_ORDERS_PER_TURN:
+        if qty > 0 and prod_name not in ("GOOSE", "COW", "SHEEP") and len(market_orders) < MAX_MARKET_ORDERS_PER_TURN:
             current_market_inv = game_state.market.get_inventory(prod_name)
 
             if days_left <= 2:
@@ -129,10 +138,19 @@ def agent(obs: Dict[str, Any], config: Optional[Dict[str, Any]] = None) -> Dict[
 
     # 4. Tactical Spatial Routing & Action Dispatch (Capa 3)
     preferred_order = plan.preferred_seed_order if plan else None
-    tactical_response = tactical_router.assign_actions(game_state, preferred_seed_order=preferred_order)
+    fert_targets = plan.fertilizer_target_tiles if plan else None
+    build_orders = plan.structure_build_orders if plan else None
+
+    tactical_response = tactical_router.assign_actions(
+        game_state,
+        preferred_seed_order=preferred_order,
+        fertilizer_target_tiles=fert_targets,
+        structure_build_orders=build_orders,
+    )
 
     return {
         "farmer": tactical_response["farmer"],
         "hands": tactical_response["hands"],
         "market": market_orders,
     }
+
