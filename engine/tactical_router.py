@@ -2,6 +2,8 @@
 Tactical Spatial Scheduler (Layer 3) for Kaggriculture.
 Resolves multi-agent pathfinding (A*), prioritizes daily farm tasks (P0-P3),
 and coordinates simultaneous actions for Farmer and Farm Hands without turn loss.
+Handles livestock logistics (PICKUP -> PLACE), structure construction (BUILD_COOP, BUILD_PASTURE),
+fertilizer routing (PICKUP -> FERTILIZE), and anti-collision deduplication.
 """
 
 from __future__ import annotations
@@ -11,10 +13,15 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from models.constants import (
     BOARD_SIZE,
     CropType,
+    AnimalType,
+    ProductType,
+    StructureType,
     Direction,
     FarmerAction,
     SHED_ACCESS_TILES,
     SHED_CAPACITY,
+    STRUCTURE_FOR_ANIMAL,
+    BUILD_ACTION_FOR_STRUCTURE,
 )
 from models.state_representation import (
     EmptyTile,
@@ -31,7 +38,7 @@ from models.state_representation import (
 class Task:
     task_type: FarmerAction
     target_pos: Tuple[int, int]
-    priority: int  # 0=P0 (Critical), 1=P1 (Harvest/Drop), 2=P2 (Maintenance), 3=P3 (Plant/Dig)
+    priority: int  # 0=P0 (Critical), 1=P1 (Harvest/Drop/Fertilizer), 2=P2 (Maintenance/Fertilize), 3=P3 (Build/Place/Plant/Dig)
     payload: Any = None
     worker_id: Optional[int] = None
 
@@ -130,15 +137,18 @@ class TacticalRouter:
         self,
         game_state: GameState,
         preferred_seed_order: Optional[List[str]] = None,
+        fertilizer_targets: Optional[List[Tuple[int, int]]] = None,
+        structure_build_orders: Optional[List[Tuple[str, Tuple[int, int]]]] = None,
     ) -> List[Task]:
         """
         Scans the farm grid and generates prioritized tasks:
         - P0: Critical survival (plants/animals dying tonight if ignored)
-        - P1: Harvesting mature produce and animal products
-        - P2: Routine daily maintenance (watering, feeding, fertilizer collection, care)
-        - P3: Expansion, weed removal (DIG), and seeding (PLANT)
+        - P1: Harvesting mature produce, animal yields, collecting fertilizer
+        - P2: Routine daily maintenance (watering, feeding, caring, fertilizing)
+        - P3: Structure construction (BUILD_COOP/BUILD_PASTURE), weed removal (DIG), and seeding (PLANT)
         """
         my_farm = game_state.my_farm
+        current_day = game_state.day
         tasks: List[Task] = []
 
         # Available seeds copy for plant tasks
@@ -150,6 +160,13 @@ class TacticalRouter:
             CropType.CARROT.value,
             CropType.WHEAT.value,
         ]
+
+        build_order_dict: Dict[Tuple[int, int], str] = {}
+        if structure_build_orders:
+            for struct_kind, pos in structure_build_orders:
+                build_order_dict[pos] = struct_kind
+
+        fert_target_set: Set[Tuple[int, int]] = set(fertilizer_targets or [])
 
         # Scan all 10x10 tiles
         for y in range(BOARD_SIZE):
@@ -172,13 +189,21 @@ class TacticalRouter:
                             target_pos=(x, y),
                             priority=1,
                         ))
-                    # P2: Regular watering
-                    elif not tile.watered_today:
-                        tasks.append(Task(
-                            task_type=FarmerAction.WATER,
-                            target_pos=(x, y),
-                            priority=2,
-                        ))
+                    # P2: Regular maintenance & fertilization
+                    else:
+                        if not tile.watered_today:
+                            tasks.append(Task(
+                                task_type=FarmerAction.WATER,
+                                target_pos=(x, y),
+                                priority=2,
+                            ))
+                        # P2: Fertilizer application on planned target
+                        if (x, y) in fert_target_set and tile.fertilized_until_day < current_day:
+                            tasks.append(Task(
+                                task_type=FarmerAction.FERTILIZE,
+                                target_pos=(x, y),
+                                priority=2,
+                            ))
 
                 # 2. Animals / Structures
                 elif isinstance(tile, StructureTile) and tile.is_occupied:
@@ -196,26 +221,27 @@ class TacticalRouter:
                             target_pos=(x, y),
                             priority=1,
                         ))
-                    # P2: Maintenance
-                    else:
-                        if not tile.fed_today:
-                            tasks.append(Task(
-                                task_type=FarmerAction.FEED,
-                                target_pos=(x, y),
-                                priority=2,
-                            ))
-                        if tile.fertilizer_available:
-                            tasks.append(Task(
-                                task_type=FarmerAction.COLLECT_FERTILIZER,
-                                target_pos=(x, y),
-                                priority=2,
-                            ))
-                        if not tile.cared_today and tile.fed_today:
-                            tasks.append(Task(
-                                task_type=FarmerAction.CARE,
-                                target_pos=(x, y),
-                                priority=2,
-                            ))
+                    # P1: Collect available fertilizer
+                    if tile.fertilizer_available:
+                        tasks.append(Task(
+                            task_type=FarmerAction.COLLECT_FERTILIZER,
+                            target_pos=(x, y),
+                            priority=1,
+                        ))
+                    # P2: Maintenance (Feeding & Care)
+                    if not tile.fed_today and not tile.is_in_danger:
+                        tasks.append(Task(
+                            task_type=FarmerAction.FEED,
+                            target_pos=(x, y),
+                            priority=2,
+                        ))
+                    if not tile.cared_today and tile.fed_today:
+                        tasks.append(Task(
+                            task_type=FarmerAction.CARE,
+                            target_pos=(x, y),
+                            priority=2,
+                        ))
+
 
                 # 3. Weeds
                 elif isinstance(tile, WeedTile):
@@ -226,23 +252,32 @@ class TacticalRouter:
                         priority=3,
                     ))
 
-                # 4. Empty Unlocked Tiles -> Planting
+                # 4. Empty Unlocked Tiles -> Construction or Planting
                 elif isinstance(tile, EmptyTile):
-                    # Check if we have seeds to plant on this empty tile
-                    chosen_seed: Optional[str] = None
-                    for seed_name in seed_order:
-                        if available_seeds.get(seed_name, 0) > 0:
-                            chosen_seed = seed_name
-                            available_seeds[seed_name] -= 1
-                            break
-
-                    if chosen_seed is not None:
+                    if (x, y) in build_order_dict:
+                        struct_kind = build_order_dict[(x, y)]
+                        act = FarmerAction.BUILD_COOP if struct_kind == StructureType.COOP.value else FarmerAction.BUILD_PASTURE
                         tasks.append(Task(
-                            task_type=FarmerAction.PLANT,
+                            task_type=act,
                             target_pos=(x, y),
                             priority=3,
-                            payload=chosen_seed,
+                            payload=struct_kind,
                         ))
+                    else:
+                        chosen_seed: Optional[str] = None
+                        for seed_name in seed_order:
+                            if available_seeds.get(seed_name, 0) > 0:
+                                chosen_seed = seed_name
+                                available_seeds[seed_name] -= 1
+                                break
+
+                        if chosen_seed is not None:
+                            tasks.append(Task(
+                                task_type=FarmerAction.PLANT,
+                                target_pos=(x, y),
+                                priority=3,
+                                payload=chosen_seed,
+                            ))
 
         # Sort tasks strictly by priority ascending
         tasks.sort(key=lambda t: t.priority)
@@ -252,66 +287,222 @@ class TacticalRouter:
         self,
         game_state: GameState,
         preferred_seed_order: Optional[List[str]] = None,
+        fertilizer_target_tiles: Optional[List[Tuple[int, int]]] = None,
+        structure_build_orders: Optional[List[Tuple[str, Tuple[int, int]]]] = None,
     ) -> Dict[str, Any]:
         """
         Coordinates all workers (Farmer and Farm Hands):
         - Handles inventory dumping when backpack has items and shed has capacity
+        - Coordinates livestock placement (PICKUP in shed -> PLACE in empty structure)
+        - Coordinates fertilizer distribution (PICKUP in shed -> FERTILIZE on target crop)
         - Assigns prioritized tasks via bipartite greedy matching
-        - Prevents multiple units from claiming the same tile or seed
+        - Prevents multiple units from claiming the same animal, tile, or seed
         - Emits valid Kaggle action commands for all workers
         """
         my_farm = game_state.my_farm
+        current_day = game_state.day
         all_workers: List[UnitState] = my_farm.all_units
 
         farmer_action: List[str] = [FarmerAction.PASS.value]
         hands_actions: List[List[str]] = [[FarmerAction.PASS.value] for _ in my_farm.hands]
 
-        # Tracking assigned positions and seeds
+        # Tracking assigned positions, animals, and resources
         claimed_tiles: Set[Tuple[int, int]] = set()
+        claimed_feed_animals: Set[Tuple[int, int]] = set()
+        claimed_care_animals: Set[Tuple[int, int]] = set()
+        claimed_structures: Set[Tuple[int, int]] = set()
         local_seeds: Dict[str, int] = dict(my_farm.seeds)
+        local_shed: Dict[str, int] = dict(my_farm.shed)
 
         # Worker status: True if action already determined
         worker_busy: List[bool] = [False] * len(all_workers)
 
         # -------------------------------------------------------------
-        # STEP 1: Handle backpack drops for workers carrying inventory
+        # STEP 1: Handle workers carrying inventory
         # -------------------------------------------------------------
         for w_idx, worker in enumerate(all_workers):
-            if worker.has_inventory:
-                # If unit is orthogonally adjacent to shed, emit DROP
-                if self.is_shed_adjacent(worker.pos):
-                    act = [FarmerAction.DROP.value]
+            if not worker.has_inventory:
+                continue
+
+            inv = worker.inventory
+            # Case A: Worker is carrying an Animal (GOOSE, COW, SHEEP) -> route to empty structure
+            carried_animal: Optional[str] = None
+            for a_name in (AnimalType.GOOSE.value, AnimalType.COW.value, AnimalType.SHEEP.value):
+                if inv.get(a_name, 0) > 0:
+                    carried_animal = a_name
+                    break
+
+            if carried_animal is not None:
+                req_struct_type = STRUCTURE_FOR_ANIMAL.get(carried_animal, StructureType.COOP.value)
+                empty_structs = [
+                    (x, y) for x, y, tile in my_farm.get_empty_structures(req_struct_type)
+                    if (x, y) not in claimed_structures
+                ]
+                if empty_structs:
+                    # Target closest empty structure
+                    target_struct = min(empty_structs, key=lambda pos: self.manhattan_distance(worker.pos, pos))
+                    claimed_structures.add(target_struct)
+
+                    if worker.pos == target_struct:
+                        act = [FarmerAction.PLACE.value, carried_animal, 1]
+                    else:
+                        step = self.get_direction_to(worker.pos, target_struct)
+                        act = [step] if step else [FarmerAction.PASS.value]
+
                     if w_idx == 0:
                         farmer_action = act
                     else:
                         hands_actions[w_idx - 1] = act
                     worker_busy[w_idx] = True
+                    continue
+
+            # Case B: Worker is carrying Fertilizer -> route to target crop
+            if inv.get(ProductType.FERTILIZER.value, 0) > 0:
+                fert_targets = [
+                    pos for pos in (fertilizer_target_tiles or [])
+                    if pos not in claimed_tiles and isinstance(my_farm.get_tile(pos[0], pos[1]), PlantTile)
+                    and my_farm.get_tile(pos[0], pos[1]).fertilized_until_day < current_day
+                ]
+                if not fert_targets:
+                    # Fallback to any unfertilized plant
+                    fert_targets = [
+                        (x, y) for x, y, tile in my_farm.get_fertilizable_plants(current_day)
+                        if (x, y) not in claimed_tiles
+                    ]
+
+                if fert_targets:
+                    target_crop_pos = min(fert_targets, key=lambda pos: self.manhattan_distance(worker.pos, pos))
+                    claimed_tiles.add(target_crop_pos)
+
+                    if worker.pos == target_crop_pos:
+                        act = [FarmerAction.FERTILIZE.value]
+                    else:
+                        step = self.get_direction_to(worker.pos, target_crop_pos)
+                        act = [step] if step else [FarmerAction.PASS.value]
+
+                    if w_idx == 0:
+                        farmer_action = act
+                    else:
+                        hands_actions[w_idx - 1] = act
+                    worker_busy[w_idx] = True
+                    continue
+
+            # Case C: Worker is carrying produce / items -> route to Shed to DROP
+            if self.is_shed_adjacent(worker.pos):
+                act = [FarmerAction.DROP.value]
+                if w_idx == 0:
+                    farmer_action = act
                 else:
-                    # Navigate towards nearest shed access tile
-                    nearest_shed = self.get_nearest_shed_tile(worker.pos)
-                    step = self.get_direction_to(worker.pos, nearest_shed)
-                    act = [step] if step else [FarmerAction.PASS.value]
-                    if w_idx == 0:
-                        farmer_action = act
-                    else:
-                        hands_actions[w_idx - 1] = act
-                    worker_busy[w_idx] = True
+                    hands_actions[w_idx - 1] = act
+                worker_busy[w_idx] = True
+            else:
+                nearest_shed = self.get_nearest_shed_tile(worker.pos)
+                step = self.get_direction_to(worker.pos, nearest_shed)
+                act = [step] if step else [FarmerAction.PASS.value]
+                if w_idx == 0:
+                    farmer_action = act
+                else:
+                    hands_actions[w_idx - 1] = act
+                worker_busy[w_idx] = True
 
         # -------------------------------------------------------------
-        # STEP 2: Generate and assign prioritized tasks to free workers
+        # STEP 2: Handle Shed Pickup Logistics for Animal / Fertilizer
         # -------------------------------------------------------------
         unassigned_workers = [i for i, busy in enumerate(worker_busy) if not busy]
 
+        # 2A. Check animal placement from Shed
+        shed_animals = {
+            k: v for k, v in local_shed.items()
+            if k in (AnimalType.GOOSE.value, AnimalType.COW.value, AnimalType.SHEEP.value) and v > 0
+        }
+
+        for animal_name, qty in shed_animals.items():
+            if not unassigned_workers or qty <= 0:
+                break
+            req_struct_type = STRUCTURE_FOR_ANIMAL.get(animal_name, StructureType.COOP.value)
+            empty_structs = [
+                (x, y) for x, y, tile in my_farm.get_empty_structures(req_struct_type)
+                if (x, y) not in claimed_structures
+            ]
+            if not empty_structs:
+                continue
+
+            # Find closest unassigned worker to Shed
+            best_w_idx = min(unassigned_workers, key=lambda i: self.manhattan_distance(all_workers[i].pos, self.get_nearest_shed_tile(all_workers[i].pos)))
+            worker = all_workers[best_w_idx]
+            unassigned_workers.remove(best_w_idx)
+            worker_busy[best_w_idx] = True
+            local_shed[animal_name] -= 1
+            claimed_structures.add(empty_structs[0])
+
+            if self.is_shed_adjacent(worker.pos):
+                act = [FarmerAction.PICKUP.value, animal_name, 1]
+            else:
+                nearest_shed = self.get_nearest_shed_tile(worker.pos)
+                step = self.get_direction_to(worker.pos, nearest_shed)
+                act = [step] if step else [FarmerAction.PASS.value]
+
+            if best_w_idx == 0:
+                farmer_action = act
+            else:
+                hands_actions[best_w_idx - 1] = act
+
+        # 2B. Check fertilizer pickup from Shed if target fertilizable crops exist
+        shed_fert_qty = local_shed.get(ProductType.FERTILIZER.value, 0)
+        unfertilized_crops = [
+            pos for pos in (fertilizer_target_tiles or [])
+            if pos not in claimed_tiles and isinstance(my_farm.get_tile(pos[0], pos[1]), PlantTile)
+            and my_farm.get_tile(pos[0], pos[1]).fertilized_until_day < current_day
+        ]
+
+        if shed_fert_qty > 0 and unfertilized_crops and unassigned_workers:
+            for _ in range(min(shed_fert_qty, len(unfertilized_crops), len(unassigned_workers))):
+                if not unassigned_workers:
+                    break
+                best_w_idx = min(unassigned_workers, key=lambda i: self.manhattan_distance(all_workers[i].pos, self.get_nearest_shed_tile(all_workers[i].pos)))
+                worker = all_workers[best_w_idx]
+                unassigned_workers.remove(best_w_idx)
+                worker_busy[best_w_idx] = True
+                local_shed[ProductType.FERTILIZER.value] -= 1
+
+                if self.is_shed_adjacent(worker.pos):
+                    act = [FarmerAction.PICKUP.value, ProductType.FERTILIZER.value, 1]
+                else:
+                    nearest_shed = self.get_nearest_shed_tile(worker.pos)
+                    step = self.get_direction_to(worker.pos, nearest_shed)
+                    act = [step] if step else [FarmerAction.PASS.value]
+
+                if best_w_idx == 0:
+                    farmer_action = act
+                else:
+                    hands_actions[best_w_idx - 1] = act
+
+        # -------------------------------------------------------------
+        # STEP 3: Generate and assign prioritized tasks to remaining workers
+        # -------------------------------------------------------------
         if unassigned_workers:
-            tasks = self.generate_daily_tasks(game_state, preferred_seed_order)
+            tasks = self.generate_daily_tasks(
+                game_state,
+                preferred_seed_order=preferred_seed_order,
+                fertilizer_targets=fertilizer_target_tiles,
+                structure_build_orders=structure_build_orders,
+            )
 
             # Group tasks by priority level (0, 1, 2, 3)
             for priority_level in (0, 1, 2, 3):
-                level_tasks = [t for t in tasks if t.priority == priority_level and t.target_pos not in claimed_tiles]
+                level_tasks = [t for t in tasks if t.priority == priority_level]
 
                 for task in level_tasks:
                     if not unassigned_workers:
                         break
+
+                    # Check deduplication rules
+                    if task.task_type == FarmerAction.FEED and task.target_pos in claimed_feed_animals:
+                        continue
+                    if task.task_type == FarmerAction.CARE and task.target_pos in claimed_care_animals:
+                        continue
+                    if task.task_type not in (FarmerAction.FEED, FarmerAction.CARE) and task.target_pos in claimed_tiles:
+                        continue
 
                     # If this is a PLANT task, verify local seed stock
                     if task.task_type == FarmerAction.PLANT:
@@ -333,7 +524,13 @@ class TacticalRouter:
                     if best_w_idx is not None:
                         worker = all_workers[best_w_idx]
                         unassigned_workers.remove(best_w_idx)
-                        claimed_tiles.add(task.target_pos)
+
+                        if task.task_type == FarmerAction.FEED:
+                            claimed_feed_animals.add(task.target_pos)
+                        elif task.task_type == FarmerAction.CARE:
+                            claimed_care_animals.add(task.target_pos)
+                        else:
+                            claimed_tiles.add(task.target_pos)
 
                         # Decrement seed stock if PLANT
                         if task.task_type == FarmerAction.PLANT:
@@ -357,7 +554,7 @@ class TacticalRouter:
                             hands_actions[best_w_idx - 1] = act
 
         # -------------------------------------------------------------
-        # STEP 3: Remaining idle workers (no tasks available)
+        # STEP 4: Remaining idle workers (no tasks available)
         # -------------------------------------------------------------
         for w_idx in unassigned_workers:
             worker = all_workers[w_idx]
@@ -379,3 +576,4 @@ class TacticalRouter:
             "hands": hands_actions,
             "market": [],
         }
+
