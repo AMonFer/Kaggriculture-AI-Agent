@@ -70,36 +70,13 @@ def agent(obs: Dict[str, Any], config: Optional[Dict[str, Any]] = None) -> Dict[
         _current_macro_plans[my_id] = macro_planner.generate_daily_macro_plan(game_state, market_sim)
         _last_plan_days[my_id] = current_day
 
-        # Issue Daily Macro Orders on the first turn of the day
-        if game_state.is_first_turn_of_day:
-            plan = _current_macro_plans[my_id]
-            # A. Land Expansion Order
-            if plan.buy_land_quadrant is not None and len(market_orders) < MAX_MARKET_ORDERS_PER_TURN:
-                market_orders.append([MarketAction.BUY_LAND.value])
-
-            # B. Wheat Reserve Buffer Order (Food safety)
-            if plan.wheat_buy_orders > 0 and len(market_orders) < MAX_MARKET_ORDERS_PER_TURN:
-                market_orders.append([MarketAction.BUY_PRODUCT.value, ProductType.WHEAT.value, plan.wheat_buy_orders])
-
-            # C. Animal Purchase Orders
-            for animal_name, qty in plan.animal_orders.items():
-                if qty > 0 and len(market_orders) < MAX_MARKET_ORDERS_PER_TURN:
-                    market_orders.append([MarketAction.BUY_ANIMAL.value, animal_name, qty])
-
-            # D. Farm Hand Hiring Orders (Fibonacci labor)
-            for _ in range(plan.hands_to_hire):
-                if len(market_orders) < MAX_MARKET_ORDERS_PER_TURN:
-                    market_orders.append([MarketAction.HIRE.value])
-
-            # E. Seed Purchase Orders
-            for crop_name, qty in plan.seed_orders.items():
-                if qty > 0 and len(market_orders) < MAX_MARKET_ORDERS_PER_TURN:
-                    market_orders.append([MarketAction.BUY_SEED.value, crop_name, qty])
-
     plan = _current_macro_plans[my_id]
-
-    # 3. Market Analytics & Liquidation (Capa 1)
     days_left = 30 - current_day
+
+    # 3. Market Analytics & Liquidation (Capa 1) - 1° SELL ORDERS
+    # Shed Overflow Sentinel: If projected load >= 80, force mass liquidation
+    is_critical_shed = my_farm.is_shed_critical(0.80)
+
     for prod_name, qty in my_farm.shed.items():
         if qty > 0 and prod_name not in ("GOOSE", "COW", "SHEEP") and len(market_orders) < MAX_MARKET_ORDERS_PER_TURN:
             current_market_inv = game_state.market.get_inventory(prod_name)
@@ -107,27 +84,53 @@ def agent(obs: Dict[str, Any], config: Optional[Dict[str, Any]] = None) -> Dict[
             if days_left <= 2:
                 # Terminal Liquidation: sell all inventory before simulation ends
                 market_orders.append([MarketAction.SELL.value, prod_name, qty])
-            elif days_left <= 4:
-                # Aggressive selling in late season
+            elif is_critical_shed or days_left <= 4:
+                # Emergency Shed Sentinel or late season: aggressive batch selling with price floor 1-2
                 sell_qty = market_sim.find_optimal_sell_batch(
                     resource=prod_name,
                     current_inventory=current_market_inv,
                     available_quantity=qty,
-                    min_acceptable_price=2,
+                    min_acceptable_price=1 if is_critical_shed else 2,
                 )
                 if sell_qty > 0:
                     market_orders.append([MarketAction.SELL.value, prod_name, sell_qty])
+                elif is_critical_shed:
+                    # Force selling at least batch to prevent discard
+                    market_orders.append([MarketAction.SELL.value, prod_name, min(qty, 20)])
             else:
                 # Regular season batch selling
-                min_p = 3 if my_farm.is_shed_critical(0.75) else 6
                 sell_qty = market_sim.find_optimal_sell_batch(
                     resource=prod_name,
                     current_inventory=current_market_inv,
                     available_quantity=qty,
-                    min_acceptable_price=min_p,
+                    min_acceptable_price=5,
                 )
                 if sell_qty > 0:
                     market_orders.append([MarketAction.SELL.value, prod_name, sell_qty])
+
+    # 4. Turn 0 Macro Expansion & Resource Orders (Sequential Execution)
+    if game_state.is_first_turn_of_day:
+        # 2° BUY_LAND Order
+        if plan.buy_land_quadrant is not None and len(market_orders) < MAX_MARKET_ORDERS_PER_TURN:
+            market_orders.append([MarketAction.BUY_LAND.value])
+
+        # 3° HIRE Orders (Labor scaling)
+        for _ in range(plan.hands_to_hire):
+            if len(market_orders) < MAX_MARKET_ORDERS_PER_TURN:
+                market_orders.append([MarketAction.HIRE.value])
+
+        # 4° BUY_PRODUCT / BUY_ANIMAL Orders
+        if plan.wheat_buy_orders > 0 and len(market_orders) < MAX_MARKET_ORDERS_PER_TURN:
+            market_orders.append([MarketAction.BUY_PRODUCT.value, ProductType.WHEAT.value, plan.wheat_buy_orders])
+
+        for animal_name, qty in plan.animal_orders.items():
+            if qty > 0 and len(market_orders) < MAX_MARKET_ORDERS_PER_TURN:
+                market_orders.append([MarketAction.BUY_ANIMAL.value, animal_name, qty])
+
+        # 5° BUY_SEED Orders
+        for crop_name, qty in plan.seed_orders.items():
+            if qty > 0 and len(market_orders) < MAX_MARKET_ORDERS_PER_TURN:
+                market_orders.append([MarketAction.BUY_SEED.value, crop_name, qty])
 
     # Mid-day emergency seed replenishment if farm is completely out of seeds (only after turn 0)
     total_seeds = sum(my_farm.seeds.values())

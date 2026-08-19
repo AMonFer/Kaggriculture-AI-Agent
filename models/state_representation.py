@@ -14,6 +14,7 @@ from .constants import (
     TOTAL_DAYS,
     TOTAL_TURNS,
     QUADRANT_BOUNDS,
+    CROP_SPECS,
     CropType,
     AnimalType,
     ProductType,
@@ -56,8 +57,17 @@ class PlantTile:
     def is_fertilized(self) -> bool:
         return self.fertilized_until_day >= 0
 
+    def is_mature(self, current_day: int) -> bool:
+        """True if the plant has reached its required growth days to yield."""
+        spec = CROP_SPECS.get(self.crop)
+        if spec is not None:
+            age = current_day - self.planted_day
+            return age >= spec.time_to_first_yield and self.yield_units > 0
+        return self.yield_units > 0
+
     @property
     def is_ready_to_harvest(self) -> bool:
+        """Default property check when current_day is not provided."""
         return self.yield_units > 0
 
     @property

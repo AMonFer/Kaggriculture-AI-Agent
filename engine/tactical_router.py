@@ -68,6 +68,89 @@ class TacticalRouter:
         """Returns True if the position is one of the 4 valid shed interaction tiles."""
         return pos in self.shed_tiles
 
+    @staticmethod
+    def get_tile_quadrant(pos: Tuple[int, int]) -> str:
+        """Determines the quadrant (NW, NE, SW, SE) for a given (x, y) coordinate."""
+        x, y = pos
+        if x < 5 and y < 5:
+            return "NW"
+        elif x >= 5 and y < 5:
+            return "NE"
+        elif x < 5 and y >= 5:
+            return "SW"
+        else:
+            return "SE"
+
+    @staticmethod
+    def get_quadrant_center(quadrant: str) -> Tuple[int, int]:
+        """Returns approximate center coordinate for a quadrant."""
+        centers = {
+            "NW": (2, 2),
+            "NE": (7, 2),
+            "SW": (2, 7),
+            "SE": (7, 7),
+        }
+        return centers.get(quadrant, (2, 2))
+
+    def assign_worker_clusters(self, game_state: GameState, tasks: List[Task]) -> Dict[int, str]:
+        """
+        Assigns each active worker (Farmer=0, Hands=1..N) to an unlocked quadrant
+        based on pending task density and spatial proximity.
+        """
+        my_farm = game_state.my_farm
+        unlocked_quads = list(my_farm.unlocked_quadrants)
+        workers = my_farm.all_units
+
+        # If only 1 quadrant unlocked, all workers assigned there
+        if len(unlocked_quads) == 1:
+            return {w.id: unlocked_quads[0] for w in workers}
+
+        # Count tasks per unlocked quadrant
+        quad_task_counts = {q: 0 for q in unlocked_quads}
+        for task in tasks:
+            q = self.get_tile_quadrant(task.target_pos)
+            if q in quad_task_counts:
+                quad_task_counts[q] += 1
+
+        total_tasks = sum(quad_task_counts.values())
+        if total_tasks == 0:
+            # Distribute evenly among unlocked quadrants
+            assignments: Dict[int, str] = {}
+            for idx, w in enumerate(workers):
+                assignments[w.id] = unlocked_quads[idx % len(unlocked_quads)]
+            return assignments
+
+        # Allocate quota of workers proportionally to task density
+        assignments = {}
+        remaining_workers = list(workers)
+
+        # Sort quadrants by task count descending
+        sorted_quads = sorted(unlocked_quads, key=lambda k: quad_task_counts[k], reverse=True)
+        for q in sorted_quads:
+            if not remaining_workers:
+                break
+            count = quad_task_counts[q]
+            if count == 0:
+                continue
+
+            quota = int(round(len(workers) * (count / float(total_tasks))))
+            quota = max(1, quota)
+
+            assigned_count = 0
+            while remaining_workers and assigned_count < quota:
+                q_center = self.get_quadrant_center(q)
+                best_w = min(remaining_workers, key=lambda w: self.manhattan_distance(w.pos, q_center))
+                assignments[best_w.id] = q
+                remaining_workers.remove(best_w)
+                assigned_count += 1
+
+        # Any leftover workers assigned to quadrant with highest tasks or closest center
+        for w in remaining_workers:
+            best_q = sorted_quads[0]
+            assignments[w.id] = best_q
+
+        return assignments
+
     def get_direction_to(self, curr: Tuple[int, int], target: Tuple[int, int]) -> Optional[str]:
         """
         Determines the immediate single-step orthogonal movement towards the target.
@@ -182,8 +265,8 @@ class TacticalRouter:
                             target_pos=(x, y),
                             priority=0,
                         ))
-                    # P1: Ready to harvest
-                    elif tile.is_ready_to_harvest:
+                    # P1: Ready to harvest (only when plant reaches required maturity)
+                    elif tile.is_mature(current_day):
                         tasks.append(Task(
                             task_type=FarmerAction.HARVEST,
                             target_pos=(x, y),
@@ -260,7 +343,7 @@ class TacticalRouter:
                         tasks.append(Task(
                             task_type=act,
                             target_pos=(x, y),
-                            priority=3,
+                            priority=2,
                             payload=struct_kind,
                         ))
                     else:
@@ -387,7 +470,10 @@ class TacticalRouter:
                     worker_busy[w_idx] = True
                     continue
 
-            # Case C: Worker is carrying produce / items -> route to Shed to DROP
+            # Case C: Worker is carrying produce / items (Smart Backpack Retention)
+            # - If adjacent to Shed (step cost = 0): DROP immediately.
+            # - Otherwise: DO NOT waste 4-8 steps walking to Shed. Retain backpack contents
+            #   and continue working; simulator auto-drops at Turn 23 for free!
             if self.is_shed_adjacent(worker.pos):
                 act = [FarmerAction.DROP.value]
                 if w_idx == 0:
@@ -396,14 +482,8 @@ class TacticalRouter:
                     hands_actions[w_idx - 1] = act
                 worker_busy[w_idx] = True
             else:
-                nearest_shed = self.get_nearest_shed_tile(worker.pos)
-                step = self.get_direction_to(worker.pos, nearest_shed)
-                act = [step] if step else [FarmerAction.PASS.value]
-                if w_idx == 0:
-                    farmer_action = act
-                else:
-                    hands_actions[w_idx - 1] = act
-                worker_busy[w_idx] = True
+                # Do not mark worker_busy; worker remains available for agricultural tasks
+                pass
 
         # -------------------------------------------------------------
         # STEP 2: Handle Shed Pickup Logistics for Animal / Fertilizer
@@ -478,7 +558,7 @@ class TacticalRouter:
                     hands_actions[best_w_idx - 1] = act
 
         # -------------------------------------------------------------
-        # STEP 3: Generate and assign prioritized tasks to remaining workers
+        # STEP 3: Generate and assign prioritized tasks with Spatial Affinity
         # -------------------------------------------------------------
         if unassigned_workers:
             tasks = self.generate_daily_tasks(
@@ -487,6 +567,9 @@ class TacticalRouter:
                 fertilizer_targets=fertilizer_target_tiles,
                 structure_build_orders=structure_build_orders,
             )
+
+            # Assign spatial cluster/quadrant to each worker
+            worker_clusters = self.assign_worker_clusters(game_state, tasks)
 
             # Group tasks by priority level (0, 1, 2, 3)
             for priority_level in (0, 1, 2, 3):
@@ -510,15 +593,25 @@ class TacticalRouter:
                         if local_seeds.get(crop_name, 0) <= 0:
                             continue  # No more seeds of this type available this turn
 
-                    # Find the nearest unassigned worker to this task
+                    task_quad = self.get_tile_quadrant(task.target_pos)
+
+                    # Find best unassigned worker using Local Affinity & Boundary Crossing
                     best_w_idx: Optional[int] = None
-                    best_dist = 999
+                    best_score = 999
 
                     for w_idx in unassigned_workers:
-                        w_pos = all_workers[w_idx].pos
+                        worker_obj = all_workers[w_idx]
+                        w_pos = worker_obj.pos
                         d = self.manhattan_distance(w_pos, task.target_pos)
-                        if d < best_dist:
-                            best_dist = d
+
+                        # P0 tasks ignore affinity penalty (rush to save dying plants/animals)
+                        # P1/P2/P3 add affinity penalty (+10) for crossing into other quadrants
+                        w_quad = worker_clusters.get(worker_obj.id, "NW")
+                        affinity_penalty = 0 if (priority_level == 0 or w_quad == task_quad) else 10
+                        score = d + affinity_penalty
+
+                        if score < best_score:
+                            best_score = score
                             best_w_idx = w_idx
 
                     if best_w_idx is not None:
@@ -554,11 +647,11 @@ class TacticalRouter:
                             hands_actions[best_w_idx - 1] = act
 
         # -------------------------------------------------------------
-        # STEP 4: Remaining idle workers (no tasks available)
+        # STEP 4: Remaining idle workers (no tasks available on board)
         # -------------------------------------------------------------
         for w_idx in unassigned_workers:
             worker = all_workers[w_idx]
-            # Move towards center (4, 4) if far away, else PASS
+            # If idle and far from shed, move towards center/shed; if at shed, PASS
             if worker.pos not in self.shed_tiles:
                 nearest_shed = self.get_nearest_shed_tile(worker.pos)
                 step = self.get_direction_to(worker.pos, nearest_shed)

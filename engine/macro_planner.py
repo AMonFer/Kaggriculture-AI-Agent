@@ -305,7 +305,10 @@ class MacroPlanner:
         best_daily_roi: float,
     ) -> Optional[str]:
         """
-        Evaluates whether buying the next quadrant (NE, SW, SE) is financially amortizable.
+        Evaluates whether buying the next quadrant (NE, SW, SE) is financially amortizable:
+        - NE ($1,000): Early Rush in Days 3-6 (or earlier if solvent). Seed buffer calculated with base crop (Carrot $20 * 25 = $500).
+        - SW ($2,000): Days 8-12 when solvent.
+        - SE ($4,000): Days 13-18 when amortizable expected return exceeds hurdle rate ($500).
         """
         my_farm = game_state.my_farm
         unlocked = my_farm.unlocked_quadrants
@@ -323,31 +326,55 @@ class MacroPlanner:
             return None  # All quadrants already unlocked
 
         quad_cost = QUADRANT_COSTS.get(next_quad, 99999)
+        existing_seeds = sum(my_farm.seeds.values())
+        seeds_needed = max(0, 25 - existing_seeds)
 
-        # Minimum required days to amortize: NE=8 days, SW=10 days, SE=12 days
-        min_days_required = {"NE": 8, "SW": 10, "SE": 12}.get(next_quad, 10)
-        if days_left < min_days_required:
-            return None
+        # Early NE Rush: base seed cost is Carrot ($20) -> $500 cushion for 25 tiles
+        seed_cushion = seeds_needed * 20.0
 
-        if best_daily_roi <= 2.0:
-            return None
+        if next_quad == "NE":
+            # Early NE Rush window (Days 2-8 or whenever solvent)
+            if days_left < 6 or best_daily_roi <= 1.0:
+                return None
+            # Need quadrant cost ($1,000) + seed cushion + buffer
+            required_money = quad_cost + seed_cushion + 50.0
+            if my_farm.money < required_money:
+                return None
 
-        # Cash buffer requirement: must have cost + $300 reserve for seeds and labor
-        cash_reserve_needed = quad_cost + 300.0
-        if my_farm.money < cash_reserve_needed:
-            return None
+            # Check utilization of initial NW quadrant (at least 8 occupied/planted tiles or seeds)
+            active_utilization = my_farm.get_plant_count() + len(my_farm.get_occupied_structures()) + existing_seeds
+            if active_utilization < 6 and len(unlocked) == 1:
+                return None
 
-        # Check current farm utilization: at least 60% of current tiles should be occupied/cultivated
-        total_unlocked_tiles = len(unlocked) * 25
-        active_plants = my_farm.get_plant_count()
-        if (active_plants / float(total_unlocked_tiles)) < 0.50 and total_unlocked_tiles >= 25:
-            # Don't expand if current land is underutilized
-            return None
+            return "NE"
 
-        # Projected net return on 25 new tiles over remaining days
-        projected_new_revenue = 25 * (days_left - 1) * best_daily_roi * 0.75
-        if projected_new_revenue > (quad_cost + 200):
-            return next_quad
+        elif next_quad == "SW":
+            # SW Window (Days 6-15 or whenever solvent)
+            if days_left < 8 or best_daily_roi <= 1.0:
+                return None
+            required_money = quad_cost + seed_cushion + 50.0
+            if my_farm.money < required_money:
+                return None
+
+            total_unlocked_tiles = len(unlocked) * 25
+            active_utilization = my_farm.get_plant_count() + len(my_farm.get_occupied_structures()) + existing_seeds
+            if (active_utilization / float(total_unlocked_tiles)) < 0.30:
+                return None
+
+            return "SW"
+
+        elif next_quad == "SE":
+            # SE Window (Days 10-20)
+            if days_left < 10 or best_daily_roi <= 1.0:
+                return None
+            required_money = quad_cost + seed_cushion + 50.0
+            if my_farm.money < required_money:
+                return None
+
+            # Hurdle rate: projected net profit on 25 tiles over remaining days > $300
+            expected_profit_se = 25 * (days_left - 1) * best_daily_roi * 0.85 - 4000.0
+            if expected_profit_se > 300.0:
+                return "SE"
 
         return None
 
@@ -360,52 +387,57 @@ class MacroPlanner:
         """
         Calculates optimal number of farm hands to hire today by comparing
         estimated daily action workload against Fibonacci marginal hiring costs.
+        Workload: In 2D grid, each hand realistically achieves ~8-10 effective field actions/day.
         """
         my_farm = game_state.my_farm
         current_day = game_state.day
         days_left = 30 - current_day
 
         # Count active farm workload
-        plant_count = my_farm.get_plant_count()
-        animal_count = my_farm.get_animal_count()
-        harvests_ready = 0
-        weeds_count = 0
-
+        n_water = 0
+        n_harvest = 0
+        n_weeds = 0
         for row in my_farm.tiles:
             for tile in row:
-                if isinstance(tile, PlantTile) and tile.is_ready_to_harvest:
-                    harvests_ready += 1
+                if isinstance(tile, PlantTile):
+                    if tile.is_in_danger or not tile.watered_today:
+                        n_water += 1
+                    if tile.is_mature(current_day):
+                        n_harvest += 1
                 elif isinstance(tile, StructureTile) and tile.is_occupied:
                     if tile.yield_units > 0:
-                        harvests_ready += 1
+                        n_harvest += 1
                     if tile.fertilizer_available:
-                        harvests_ready += 1
+                        n_harvest += 1
                 elif isinstance(tile, WeedTile):
-                    weeds_count += 1
+                    n_weeds += 1
 
-        # Total estimated daily work actions needed
-        # (Watering + Harvesting + Weeding + Planting + Feeding/Caring + Transit Overhead)
-        animal_actions = animal_count * 2  # Feed + Care
-        total_actions = plant_count + animal_actions + harvests_ready + weeds_count + target_plantings
-        # Estimated transit and shed drop overhead
-        transit_overhead = int(total_actions * 0.35)
-        workload = total_actions + transit_overhead
+        animal_count = my_farm.get_animal_count()
+        animal_workload = animal_count * 4  # Feed + Care + Collect + Transit
 
-        # Farmer alone provides 24 actions at $0
-        extra_work_needed = max(0, workload - 24)
+        # Transit overhead: in 10x10 board, workers take ~2.5 moves per task
+        action_units = n_water + (n_harvest * 1.5) + target_plantings + (n_weeds * 1.2) + animal_workload
+        l_total = action_units * 2.2  # Total physical turns needed
 
-        if extra_work_needed == 0:
-            return 0
+        # Farmer provides 24 turns
+        extra_turns_needed = max(0.0, l_total - 24.0)
 
-        # Each hired hand provides ~20 effective productive actions
-        desired_hands = int(math.ceil(extra_work_needed / 20.0))
+        # Each hand provides 24 turns
+        desired_hands = int(math.ceil(extra_turns_needed / 24.0))
 
-        # In final closing days (days 28-29), only hire if heavy harvest backlog exists
+        # Dynamic baseline scaling proportional to unlocked land
+        n_quads = len(my_farm.unlocked_quadrants)
+        # Baseline minimum hands if farm has crops: 1Q: 2, 2Q: 4, 3Q: 6, 4Q: 8
+        if (n_water + target_plantings + n_harvest) >= 6:
+            min_hands = min(n_quads * 2, 8)
+            desired_hands = max(desired_hands, min_hands)
+
+        max_hands_by_quads = {1: 3, 2: 6, 3: 8, 4: 12}
+        desired_hands = min(desired_hands, max_hands_by_quads.get(n_quads, 8))
+
+        # In final closing days (days 28-29), focus on harvest
         if days_left <= 2:
-            desired_hands = min(desired_hands, int(math.ceil(harvests_ready / 18.0)))
-
-        # Cap max hands
-        desired_hands = min(desired_hands, 8)
+            desired_hands = min(desired_hands, int(math.ceil(n_harvest / 6.0)))
 
         # Budget constraint: calculate cumulative Fibonacci cost
         affordable_hands = 0
@@ -431,12 +463,35 @@ class MacroPlanner:
     ) -> Tuple[Dict[str, int], List[Tuple[str, Tuple[int, int]]], float]:
         """
         Evaluates animal purchases and structure construction:
-        - Only emits BUY_ANIMAL if an empty structure exists or BUILD_COOP/BUILD_PASTURE can be scheduled today.
-        - Prioritizes GOOSE due to EGG price resilience, limiting COW/SHEEP to 1-2 initial units.
+        - Early Day 0 synergy: allows 1-2 Cows/Geese to establish daily fertilizer & dairy cashflow.
+        - Day 4+: scales livestock when solvent (money >= $1,500).
+        - Prioritizes COW (Milk + Fertilizer) and GOOSE (Egg + Fertilizer).
         - Verifies wheat safety reserve budget before approving animal purchase.
         """
         my_farm = game_state.my_farm
         current_day = game_state.day
+
+        animal_orders: Dict[str, int] = {}
+        build_orders: List[Tuple[str, Tuple[int, int]]] = []
+        spent_budget = 0.0
+
+        # Capital gating for livestock:
+        if current_day == 0:
+            # On Day 0, allow early livestock if starting cash >= $2,000
+            if my_farm.money < 2000.0 or available_budget < 350:
+                return animal_orders, build_orders, spent_budget
+        elif current_day in (1, 2, 3):
+            # Days 1-3: allow animal if cash is healthy (>= $1,800)
+            if my_farm.money < 1800.0 or available_budget < 350:
+                return animal_orders, build_orders, spent_budget
+        else:
+            # Day 4+: Require bank money >= $1,500
+            if my_farm.money < 1500.0 or available_budget < 350:
+                return animal_orders, build_orders, spent_budget
+
+        # Don't buy new animals in closing season
+        if current_day > 18:
+            return animal_orders, build_orders, spent_budget
 
         # Find empty structures and empty unlocked tiles for potential construction
         empty_coops = my_farm.get_empty_structures(StructureType.COOP.value)
@@ -452,35 +507,34 @@ class MacroPlanner:
         net_empty_coops = max(0, len(empty_coops) - pending_goose_in_shed)
         net_empty_pastures = max(0, len(empty_pastures) - (pending_cow_in_shed + pending_sheep_in_shed))
 
-        # Find empty tiles for building new structures
+        # Find empty tiles for building new structures (sorted near Shed for zero-overhead logistics)
         empty_tiles: List[Tuple[int, int]] = []
         for y, row in enumerate(my_farm.tiles):
             for x, tile in enumerate(row):
                 if isinstance(tile, EmptyTile):
                     empty_tiles.append((x, y))
-
-        animal_orders: Dict[str, int] = {}
-        build_orders: List[Tuple[str, Tuple[int, int]]] = []
-        spent_budget = 0.0
-
-        # Don't buy animals in late season
-        if current_day > 14 or available_budget < 350:
-            return animal_orders, build_orders, spent_budget
+        empty_tiles.sort(key=lambda pos: abs(pos[0] - 4) + abs(pos[1] - 4))
 
         # Animal counts currently on farm
         goose_count = my_farm.get_animal_count(AnimalType.GOOSE.value) + pending_goose_in_shed
         cow_count = my_farm.get_animal_count(AnimalType.COW.value) + pending_cow_in_shed
         sheep_count = my_farm.get_animal_count(AnimalType.SHEEP.value) + pending_sheep_in_shed
 
+        # Max animal caps scaled by land
+        n_quads = len(my_farm.unlocked_quadrants)
+        max_cows = 3 if n_quads == 1 else (6 if n_quads == 2 else 12)
+        max_geese = 2 if n_quads == 1 else (4 if n_quads == 2 else 6)
+        max_sheep = 0 if n_quads == 1 else (2 if n_quads == 2 else 4)
+
         # Best crop ROI to compare with
         valid_crop_rois = [r for r in crop_rois.values() if r > 0 and not math.isinf(r)]
         best_crop_roi = max(valid_crop_rois) if valid_crop_rois else 5.0
 
-        # Preference order: GOOSE first, then COW/SHEEP (capped at 1-2 units)
+        # Preference order: COW first (Milk $160 + Fertilizer $100 daily), then GOOSE, then SHEEP
         candidate_animals = [
-            (AnimalType.GOOSE.value, ANIMAL_SPECS[AnimalType.GOOSE.value], net_empty_coops, StructureType.COOP.value, goose_count, 3),
-            (AnimalType.COW.value, ANIMAL_SPECS[AnimalType.COW.value], net_empty_pastures, StructureType.PASTURE.value, cow_count, 1),
-            (AnimalType.SHEEP.value, ANIMAL_SPECS[AnimalType.SHEEP.value], net_empty_pastures, StructureType.PASTURE.value, sheep_count, 1),
+            (AnimalType.COW.value, ANIMAL_SPECS[AnimalType.COW.value], net_empty_pastures, StructureType.PASTURE.value, cow_count, max_cows),
+            (AnimalType.GOOSE.value, ANIMAL_SPECS[AnimalType.GOOSE.value], net_empty_coops, StructureType.COOP.value, goose_count, max_geese),
+            (AnimalType.SHEEP.value, ANIMAL_SPECS[AnimalType.SHEEP.value], net_empty_pastures, StructureType.PASTURE.value, sheep_count, max_sheep),
         ]
 
         tile_idx = 0
@@ -652,7 +706,9 @@ class MacroPlanner:
         cash_after_livestock = max(0.0, cash_after_land - spent_livestock)
 
         # 4. Seed budget allocation (bounded by empty tiles minus planned structures)
-        seed_budget = cash_after_livestock * 0.85
+        # Reserve a modest $30 buffer for Fibonacci labor hiring
+        labor_reserve = 30.0 if cash_after_livestock > 50 else 0.0
+        seed_budget = max(0.0, cash_after_livestock - labor_reserve)
         seed_orders, preferred_seed_order = self.allocate_seed_budget(
             game_state, crop_rois, seed_budget, planned_structures_count=len(build_orders)
         )

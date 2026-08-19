@@ -135,11 +135,30 @@ def test_game_state_parsing_accuracy(sample_raw_observation):
     locked_tile = my_farm.get_tile(7, 7)
     assert isinstance(locked_tile, LockedTile)
 
-    # Shed check
     assert my_farm.shed_items_count == 25  # 20 wheat + 5 eggs (seeds excluded)
     assert my_farm.shed_free_capacity == 75
     assert my_farm.shed_occupancy_ratio == 0.25
     assert my_farm.is_shed_critical() is False
+
+
+def test_game_state_projected_load_and_quadrant_helpers(sample_raw_observation):
+    game_state = GameState.from_raw_obs(sample_raw_observation)
+    my_farm = game_state.my_farm
+
+    # Farmer has 3 wheat, Hand 1 has 1 egg, Hand 2 has 0 -> total backpack = 4
+    assert my_farm.total_backpack_load == 4
+    # Shed has 25 -> projected load = 25 + 4 = 29
+    assert my_farm.projected_shed_load == 29
+
+    # Quadrant plant count check
+    assert my_farm.get_quadrant_plant_count("NW") == 1
+    assert my_farm.get_quadrant_plant_count("NE") == 0
+
+    # Quadrant unlocked coordinates
+    nw_unlocked = my_farm.get_quadrant_unlocked_tiles("NW")
+    assert len(nw_unlocked) == 25
+    ne_unlocked = my_farm.get_quadrant_unlocked_tiles("NE")
+    assert len(ne_unlocked) == 0
 
 
 def test_game_state_parsing_performance(sample_raw_observation):

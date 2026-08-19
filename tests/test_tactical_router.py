@@ -136,9 +136,10 @@ class TestTaskGenerationAndPriorities:
             yield_units=0,
         )
 
-        # Set up a P1 harvestable plant
+        # Set up a P1 harvestable plant (mature carrot)
         farm.tiles[1][1] = PlantTile(
             crop="CARROT",
+            planted_day=-2,
             consecutive_unwatered=0,
             watered_today=True,
             yield_units=3,
@@ -302,7 +303,7 @@ class TestLivestockAndFertilizerTaskGeneration:
 
         build_tasks = [t for t in tasks if t.task_type == FarmerAction.BUILD_COOP and t.target_pos == (3, 3)]
         assert len(build_tasks) == 1
-        assert build_tasks[0].priority == 3
+        assert build_tasks[0].priority == 2
 
 
 class TestLivestockAndFertilizerLogistics:
@@ -358,4 +359,104 @@ class TestLivestockAndFertilizerLogistics:
         actions = router.assign_actions(empty_game_state, fertilizer_target_tiles=[(1, 1)])
         # Cannot fertilize the already fertilized plant
         assert actions["farmer"] != ["FERTILIZE"]
+
+
+class TestSpatialClusteringAndLocalAffinity:
+    """Validates SpatialClustering 4-zone partition, Local Affinity matching, and Boundary Crossing."""
+
+    def test_spatial_clustering_quadrant_partition(self, router: TacticalRouter):
+        assert router.get_tile_quadrant((0, 0)) == "NW"
+        assert router.get_tile_quadrant((4, 4)) == "NW"
+        assert router.get_tile_quadrant((5, 0)) == "NE"
+        assert router.get_tile_quadrant((9, 4)) == "NE"
+        assert router.get_tile_quadrant((0, 5)) == "SW"
+        assert router.get_tile_quadrant((4, 9)) == "SW"
+        assert router.get_tile_quadrant((5, 5)) == "SE"
+        assert router.get_tile_quadrant((9, 9)) == "SE"
+
+    def test_local_affinity_worker_stays_in_assigned_quadrant(self, router: TacticalRouter, empty_game_state: GameState):
+        farm = empty_game_state.my_farm
+        farm.unlocked_quadrants = {"NW", "NE"}
+
+        # Farmer at (2,2) in NW, Hand at (7,2) in NE
+        farm.farmer = UnitState(id=0, x=2, y=2)
+        farm.hands = [UnitState(id=1, x=7, y=2)]
+
+        # Plant in NW at (2,3) needing water, Plant in NE at (7,3) needing water
+        farm.tiles[3][2] = PlantTile(crop="WHEAT", watered_today=False)
+        farm.tiles[3][7] = PlantTile(crop="WHEAT", watered_today=False)
+
+        actions = router.assign_actions(empty_game_state)
+
+        # Farmer should take the local NW task (moving SOUTH to (2,3))
+        assert actions["farmer"] == ["SOUTH"]
+        # Hand should take the local NE task (moving SOUTH to (7,3))
+        assert actions["hands"][0] == ["SOUTH"]
+
+    def test_boundary_crossing_when_local_quadrant_clear(self, router: TacticalRouter, empty_game_state: GameState):
+        farm = empty_game_state.my_farm
+        farm.unlocked_quadrants = {"NW", "NE"}
+
+        # 2 workers located in NW: Farmer at (2,2), Hand at (2,3)
+        farm.farmer = UnitState(id=0, x=2, y=2)
+        farm.hands = [UnitState(id=1, x=2, y=3)]
+
+        # NW has 0 tasks. NE has 2 plants needing water at (7,2) and (7,3)
+        farm.tiles[2][7] = PlantTile(crop="WHEAT", watered_today=False)
+        farm.tiles[3][7] = PlantTile(crop="WHEAT", watered_today=False)
+
+        actions = router.assign_actions(empty_game_state)
+
+        # Since NW has 0 tasks, workers cross the boundary towards NE (EAST)
+        assert actions["farmer"] == ["EAST"]
+        assert actions["hands"][0] == ["EAST"]
+
+
+class TestSmartBackpackRetention:
+    """Validates Smart Backpack Retention: no mid-day shed transit; free night drop."""
+
+    def test_smart_backpack_no_immediate_drop_midday(self, router: TacticalRouter, empty_game_state: GameState):
+        farm = empty_game_state.my_farm
+        # Farmer at (1,1) carrying 4 harvested Melons
+        farm.farmer = UnitState(id=0, x=1, y=1, inventory={"MELON": 4})
+
+        # Plant at (1,2) needs water
+        farm.tiles[2][1] = PlantTile(crop="WHEAT", watered_today=False)
+
+        actions = router.assign_actions(empty_game_state)
+
+        # Farmer does NOT walk to shed (towards (4,4)), but moves SOUTH to (1,2) to water the plant!
+        assert actions["farmer"] == ["SOUTH"]
+
+    def test_smart_backpack_drop_at_shed_adjacent_zero_cost(self, router: TacticalRouter, empty_game_state: GameState):
+        farm = empty_game_state.my_farm
+        # Farmer at (4,4) [adjacent to shed] carrying 3 Strawberries
+        farm.farmer = UnitState(id=0, x=4, y=4, inventory={"STRAWBERRY": 3})
+
+        actions = router.assign_actions(empty_game_state)
+        # Because cost is 0, executes DROP immediately
+        assert actions["farmer"] == ["DROP"]
+
+
+class TestShedOverflowSentinel:
+    """Validates projected load calculation and 80% shed capacity critical alerts."""
+
+    def test_shed_overflow_sentinel_projected_load(self, empty_game_state: GameState):
+        farm = empty_game_state.my_farm
+        farm.shed = {"WHEAT": 50, "CARROT": 15}  # 65 in shed
+        farm.farmer = UnitState(id=0, x=0, y=0, inventory={"MELON": 10})  # 10 in backpack
+        farm.hands = [UnitState(id=1, x=1, y=1, inventory={"TOMATO": 8})]  # 8 in backpack
+
+        # Total projected load = 65 + 10 + 8 = 83 items
+        assert farm.total_backpack_load == 18
+        assert farm.projected_shed_load == 83
+        # >= 80% threshold -> is_shed_critical must return True
+        assert farm.is_shed_critical(0.80) is True
+
+        # If backpacks are empty (65 items in shed): 65 < 80 -> False
+        farm.farmer.inventory = {}
+        farm.hands[0].inventory = {}
+        assert farm.projected_shed_load == 65
+        assert farm.is_shed_critical(0.80) is False
+
 

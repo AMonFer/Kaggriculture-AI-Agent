@@ -317,10 +317,98 @@ class TestIntegratedLivestockMacroPlan:
     """Validates that daily macro plan schedules livestock and structure orders cohesively."""
 
     def test_macro_plan_generates_animal_and_structure_orders(self, planner: MacroPlanner, sim: MarketSimulator):
-        # Day 0 with $3000 cash -> should schedule animal purchase and build structure
-        state = create_mock_game_state(day=0, money=3000.0)
+        # Day 4 with $3000 cash and 2 unlocked quadrants -> should schedule animal purchase and build structure
+        state = create_mock_game_state(day=4, money=3000.0, unlocked_quadrants={"NW", "NE"})
         plan = planner.generate_daily_macro_plan(state, sim)
 
         assert "GOOSE" in plan.animal_orders or "COW" in plan.animal_orders or "SHEEP" in plan.animal_orders
         assert len(plan.structure_build_orders) > 0 or len(state.my_farm.get_empty_structures()) > 0
+
+
+class TestModuleCNewMacroPolicies:
+    """Validates Module C: Livestock Gate D0-D3, Early NE Rush, Fibonacci Scaling, and Strict Seed Caps."""
+
+    def test_livestock_gate_low_budget_blocked(self, planner: MacroPlanner, sim: MarketSimulator):
+        """When money is below $1,500, livestock purchase is blocked to protect operational cash."""
+        state_poor = create_mock_game_state(day=2, money=1200.0)
+        plan_poor = planner.generate_daily_macro_plan(state_poor, sim)
+        assert len(plan_poor.animal_orders) == 0
+        assert len(plan_poor.structure_build_orders) == 0
+
+    def test_livestock_gate_day_0_synergy(self, planner: MacroPlanner, sim: MarketSimulator):
+        """On Day 0 with $3,000 starting cash, schedules early cow/goose for daily fertilizer & milk."""
+        state_rich = create_mock_game_state(day=0, money=3000.0)
+        plan = planner.generate_daily_macro_plan(state_rich, sim)
+        assert "COW" in plan.animal_orders or "GOOSE" in plan.animal_orders
+        assert len(plan.structure_build_orders) > 0
+
+    def test_livestock_gate_day_4_requires_1500_coins(self, planner: MacroPlanner, sim: MarketSimulator):
+        """On Day 4+, requires at least $1,500 in bank to prevent quadrant expansion cannibalization."""
+        # Low money ($1,200) -> Gate remains closed
+        state_poor = create_mock_game_state(day=4, money=1200.0, unlocked_quadrants={"NW", "NE"})
+        plan_poor = planner.generate_daily_macro_plan(state_poor, sim)
+        assert len(plan_poor.animal_orders) == 0
+
+    def test_livestock_gate_day_4_allows_with_50_tiles(self, planner: MacroPlanner, sim: MarketSimulator):
+        """On Day 4+, with $2,000 cash and >= 50 tiles, Gate opens for livestock."""
+        state_rich = create_mock_game_state(day=4, money=2000.0, unlocked_quadrants={"NW", "NE"})
+        plan_rich = planner.generate_daily_macro_plan(state_rich, sim)
+        assert len(plan_rich.animal_orders) > 0
+
+    def test_land_expansion_ne_rush_day_3_to_6(self, planner: MacroPlanner):
+        """Early NE Rush: $1,000 cost + $500 carrot seed cushion + $100 buffer = $1,600."""
+        # Day 3 with $1,650 cash and 16 plants in NW -> triggers NE expansion
+        state_solvent = create_mock_game_state(day=3, money=1650.0, plant_count=16)
+        quad = planner.evaluate_land_expansion(state_solvent, best_daily_roi=15.0)
+        assert quad == "NE"
+
+        # Day 3 with $1,400 cash -> not enough for expansion + seed cushion -> returns None
+        state_insolvent = create_mock_game_state(day=3, money=1400.0, plant_count=16)
+        assert planner.evaluate_land_expansion(state_insolvent, best_daily_roi=15.0) is None
+
+    def test_early_ne_rush_with_stock_seeds_discount(self, planner: MacroPlanner):
+        """If farm already has 25 seeds in stock, seed cushion is $0 -> NE unlocks at $1,100."""
+        state_with_seeds = create_mock_game_state(day=3, money=1150.0, plant_count=16)
+        state_with_seeds.my_farm.seeds = {"CARROT": 25}
+        quad = planner.evaluate_land_expansion(state_with_seeds, best_daily_roi=15.0)
+        assert quad == "NE"
+
+    def test_land_expansion_sw_day_8_to_12(self, planner: MacroPlanner):
+        """SW expansion ($2,000) evaluated in Days 8-12."""
+        state = create_mock_game_state(day=8, money=2700.0, plant_count=25, unlocked_quadrants={"NW", "NE"})
+        quad = planner.evaluate_land_expansion(state, best_daily_roi=15.0)
+        assert quad == "SW"
+
+    def test_land_expansion_se_roi_hurdle_rate(self, planner: MacroPlanner):
+        """SE expansion ($4,000) requires expected profit hurdle > $500."""
+        # High ROI (20.0) with 16 days left -> 25 * 15 * 20 * 0.85 - 4000 = 2375 > 500 -> Approved
+        state_high_roi = create_mock_game_state(day=14, money=4700.0, plant_count=40, unlocked_quadrants={"NW", "NE", "SW"})
+        assert planner.evaluate_land_expansion(state_high_roi, best_daily_roi=20.0) == "SE"
+
+        # Very low ROI (1.0) -> Rejected
+        assert planner.evaluate_land_expansion(state_high_roi, best_daily_roi=1.0) is None
+
+    def test_labor_scaling_proportional_to_quadrants(self, planner: MacroPlanner):
+        """Validates dynamic labor caps: 1 quad <= 3 hands; 2 quads <= 6 hands."""
+        state_1q = create_mock_game_state(day=5, plant_count=24, unlocked_quadrants={"NW"})
+        hands_1q = planner.evaluate_labor_needs(state_1q, target_plantings=20, available_budget=1000.0)
+        assert hands_1q <= 3
+
+        state_2q = create_mock_game_state(day=5, plant_count=48, unlocked_quadrants={"NW", "NE"})
+        hands_2q = planner.evaluate_labor_needs(state_2q, target_plantings=20, available_budget=1000.0)
+        assert hands_2q <= 6
+
+    def test_strict_seed_budget_cap_prevents_excess_buying(self, planner: MacroPlanner, sim: MarketSimulator):
+        """Seed orders must never exceed empty unlocked tiles minus seeds in stock."""
+        # 16 plants in NW (leaving 9 empty tiles). 4 seeds in stock.
+        state = create_mock_game_state(day=5, money=3000.0, plant_count=16, unlocked_quadrants={"NW"})
+        state.my_farm.seeds = {"MELON": 4}
+
+        rois = planner.compute_crop_rois(state, sim)
+        seed_orders, _ = planner.allocate_seed_budget(state, rois, available_money=3000.0)
+
+        # Max to buy = 9 empty - 4 seeds in stock = 5 seeds
+        total_ordered = sum(seed_orders.values())
+        assert total_ordered <= 5
+
 
