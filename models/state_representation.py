@@ -13,6 +13,7 @@ from .constants import (
     TURNS_PER_DAY,
     TOTAL_DAYS,
     TOTAL_TURNS,
+    QUADRANT_BOUNDS,
     CropType,
     AnimalType,
     ProductType,
@@ -100,6 +101,7 @@ class UnitState:
     x: int
     y: int
     inventory: Dict[str, int] = field(default_factory=dict)
+    assigned_quadrant: Optional[str] = None
 
     @property
     def pos(self) -> Tuple[int, int]:
@@ -144,6 +146,16 @@ class FarmState:
         return sum(self.shed.values())
 
     @property
+    def total_backpack_load(self) -> int:
+        """Total items currently carried across all workers' backpacks."""
+        return sum(u.inventory_count for u in self.all_units)
+
+    @property
+    def projected_shed_load(self) -> int:
+        """Combined projected load in shed + all workers' backpacks."""
+        return self.shed_items_count + self.total_backpack_load
+
+    @property
     def shed_free_capacity(self) -> int:
         return max(0, SHED_CAPACITY - self.shed_items_count)
 
@@ -151,14 +163,41 @@ class FarmState:
     def shed_occupancy_ratio(self) -> float:
         return self.shed_items_count / float(SHED_CAPACITY)
 
-    def is_shed_critical(self, threshold: float = 0.85) -> bool:
-        """Sentinel check: returns True if shed occupancy reaches or exceeds threshold."""
-        return self.shed_items_count >= int(threshold * SHED_CAPACITY)
+    def is_shed_critical(self, threshold: float = 0.80) -> bool:
+        """Sentinel check: returns True if projected shed load reaches or exceeds threshold (default 80%)."""
+        return self.projected_shed_load >= int(threshold * SHED_CAPACITY)
 
     def get_tile(self, x: int, y: int) -> TileState:
         if 0 <= x < BOARD_SIZE and 0 <= y < BOARD_SIZE:
             return self.tiles[y][x]
         return LockedTile()
+
+    def get_quadrant_plant_count(self, quadrant: str = "NW", crop: Optional[str] = None) -> int:
+        """Returns count of active plant tiles in the specified quadrant."""
+        if quadrant not in QUADRANT_BOUNDS:
+            return 0
+        min_x, max_x, min_y, max_y = QUADRANT_BOUNDS[quadrant]
+        count = 0
+        for y in range(min_y, max_y + 1):
+            for x in range(min_x, max_x + 1):
+                tile = self.get_tile(x, y)
+                if isinstance(tile, PlantTile):
+                    if crop is None or tile.crop == crop:
+                        count += 1
+        return count
+
+    def get_quadrant_unlocked_tiles(self, quadrant: str) -> List[Tuple[int, int]]:
+        """Returns list of (x, y) coordinates for non-locked tiles in the specified quadrant."""
+        if quadrant not in QUADRANT_BOUNDS:
+            return []
+        min_x, max_x, min_y, max_y = QUADRANT_BOUNDS[quadrant]
+        coords = []
+        for y in range(min_y, max_y + 1):
+            for x in range(min_x, max_x + 1):
+                tile = self.get_tile(x, y)
+                if not isinstance(tile, LockedTile):
+                    coords.append((x, y))
+        return coords
 
     def get_plant_count(self, crop: Optional[str] = None) -> int:
         count = 0
